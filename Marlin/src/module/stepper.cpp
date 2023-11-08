@@ -178,9 +178,8 @@ bool Stepper::abort_current_block;
 #endif
 
 uint32_t Stepper::acceleration_time, Stepper::deceleration_time;
-#if MULTISTEPPING_LIMIT > 1
-  uint8_t Stepper::steps_per_isr = 1; // Count of steps to perform per Stepper ISR call
-#endif
+uint8_t Stepper::steps_per_isr;
+
 TERN(ADAPTIVE_STEP_SMOOTHING,,constexpr) uint8_t Stepper::oversampling_factor;
 
 xyze_long_t Stepper::delta_error{0};
@@ -213,11 +212,10 @@ uint32_t Stepper::advance_divisor = 0,
 #if ENABLED(LIN_ADVANCE)
 
   uint32_t Stepper::nextAdvanceISR = LA_ADV_NEVER,
-           Stepper::la_interval = LA_ADV_NEVER;
+  Stepper::la_interval = LA_ADV_NEVER;
   int32_t  Stepper::la_delta_error = 0,
            Stepper::la_dividend = 0,
            Stepper::la_advance_steps = 0;
-  bool     Stepper::la_active = false;
 
 #endif // LIN_ADVANCE
 
@@ -1381,7 +1379,7 @@ void Stepper::isr() {
         advance_isr();
         nextAdvanceISR = la_interval;
       }
-      else if (nextAdvanceISR > la_interval)          // Start LA steps if necessary
+      else if (nextAdvanceISR == LA_ADV_NEVER)          // Start LA steps if necessary
         nextAdvanceISR = la_interval;
     #endif
 
@@ -1696,10 +1694,11 @@ void Stepper::pulse_phase_isr() {
         PULSE_PREP(E);
 
         #if ENABLED(LIN_ADVANCE)
-          if (la_active && step_needed.e) {
+          if (step_needed.e && current_block->la_advance_rate) {
             // don't actually step here, but do subtract movements steps
             // from the linear advance step count
             step_needed.e = false;
+            count_position.e -= count_direction.e;
             la_advance_steps--;
           }
         #endif
@@ -1766,96 +1765,64 @@ void Stepper::pulse_phase_isr() {
 
 
 // Calculate timer interval, with all limits applied.
-hal_timer_t Stepper::calc_timer_interval(uint32_t step_rate) {
-
+uint32_t Stepper::calc_timer_interval(uint32_t step_rate) {
   #ifdef CPU_32_BIT
-
-    // A fast processor can just do integer division
-    constexpr uint32_t min_step_rate = uint32_t(STEPPER_TIMER_RATE) / HAL_TIMER_TYPE_MAX;
-    return step_rate > min_step_rate ? uint32_t(STEPPER_TIMER_RATE) / step_rate : HAL_TIMER_TYPE_MAX;
-
+    // In case of high-performance processor, it is able to calculate in real-time
+    return uint32_t(STEPPER_TIMER_RATE) / step_rate;
   #else
-
-    constexpr uint32_t min_step_rate = (F_CPU) / 500000U; // i.e., 32 or 40
-    if (step_rate >= 0x0800) {  // higher step rate
-      // AVR is able to keep up at around 65kHz Stepping ISR rate at most.
-      // So values for step_rate > 65535 might as well be truncated.
-      // Handle it as quickly as possible. i.e., assume highest byte is zero
-      // because non-zero would represent a step rate far beyond AVR capabilities.
-      if (uint8_t(step_rate >> 16))
-        return uint32_t(STEPPER_TIMER_RATE) / 0x10000;
-
-      const uintptr_t table_address = uintptr_t(&speed_lookuptable_fast[uint8_t(step_rate >> 8)]);
-      const uint16_t base = uint16_t(pgm_read_word(table_address));
-      const uint8_t gain = uint8_t(pgm_read_byte(table_address + 2));
-      return base - MultiU8X8toH8(uint8_t(step_rate & 0x00FF), gain);
+    // AVR is able to keep up at 30khz Stepping ISR rate.
+    constexpr uint32_t min_step_rate = (F_CPU) / 500000U;
+    if (step_rate <= min_step_rate) {
+      step_rate = 0;
+      uintptr_t table_address = (uintptr_t)&speed_lookuptable_slow[0][0];
+      return uint16_t(pgm_read_word(table_address));
     }
-    else if (step_rate > min_step_rate) { // lower step rates
+    else {
       step_rate -= min_step_rate; // Correct for minimal speed
-      const uintptr_t table_address = uintptr_t(&speed_lookuptable_slow[uint8_t(step_rate >> 3)]);
-      return uint16_t(pgm_read_word(table_address))
-             - ((uint16_t(pgm_read_word(table_address + 2)) * uint8_t(step_rate & 0x0007)) >> 3);
+      if (step_rate >= 0x0800) {  // higher step rate
+        const uint8_t rate_mod_256 = (step_rate & 0x00FF);
+        const uintptr_t table_address = uintptr_t(&speed_lookuptable_fast[uint8_t(step_rate >> 8)][0]),
+                        gain = uint16_t(pgm_read_word(table_address + 2));
+        return uint16_t(pgm_read_word(table_address)) - MultiU16X8toH16(rate_mod_256, gain);
+      }
+      else { // lower step rates
+        uintptr_t table_address = uintptr_t(&speed_lookuptable_slow[0][0]);
+        table_address += (step_rate >> 1) & 0xFFFC;
+        return uint16_t(pgm_read_word(table_address))
+               - ((uint16_t(pgm_read_word(table_address + 2)) * uint8_t(step_rate & 0x0007)) >> 3);
+      }
     }
-
-    return uint16_t(pgm_read_word(uintptr_t(speed_lookuptable_slow)));
-
-  #endif // !CPU_32_BIT
+  #endif
 }
 
 // Get the timer interval and the number of loops to perform per tick
-hal_timer_t Stepper::calc_multistep_timer_interval(uint32_t step_rate) {
+uint32_t Stepper::calc_timer_interval(uint32_t step_rate, uint8_t &loops) {
+  uint8_t multistep = 1;
+  #if DISABLED(DISABLE_MULTI_STEPPING)
 
-  #if ENABLED(OLD_ADAPTIVE_MULTISTEPPING)
+    // The stepping frequency limits for each multistepping rate
+    static const uint32_t limit[] PROGMEM = {
+      (  MAX_STEP_ISR_FREQUENCY_1X     ),
+      (  MAX_STEP_ISR_FREQUENCY_2X >> 1),
+      (  MAX_STEP_ISR_FREQUENCY_4X >> 2),
+      (  MAX_STEP_ISR_FREQUENCY_8X >> 3),
+      ( MAX_STEP_ISR_FREQUENCY_16X >> 4),
+      ( MAX_STEP_ISR_FREQUENCY_32X >> 5),
+      ( MAX_STEP_ISR_FREQUENCY_64X >> 6),
+      (MAX_STEP_ISR_FREQUENCY_128X >> 7)
+    };
 
-    #if MULTISTEPPING_LIMIT == 1
-
-      // Just make sure the step rate is doable
-      NOMORE(step_rate, uint32_t(MAX_STEP_ISR_FREQUENCY_1X));
-
-    #else
-
-      // The stepping frequency limits for each multistepping rate
-      static const uint32_t limit[] PROGMEM = {
-            (  MAX_STEP_ISR_FREQUENCY_1X     )
-          , (((F_CPU) / ISR_EXECUTION_CYCLES(1)) >> 1)
-        #if MULTISTEPPING_LIMIT >= 4
-          , (((F_CPU) / ISR_EXECUTION_CYCLES(2)) >> 2)
-        #endif
-        #if MULTISTEPPING_LIMIT >= 8
-          , (((F_CPU) / ISR_EXECUTION_CYCLES(3)) >> 3)
-        #endif
-        #if MULTISTEPPING_LIMIT >= 16
-          , (((F_CPU) / ISR_EXECUTION_CYCLES(4)) >> 4)
-        #endif
-        #if MULTISTEPPING_LIMIT >= 32
-          , (((F_CPU) / ISR_EXECUTION_CYCLES(5)) >> 5)
-        #endif
-        #if MULTISTEPPING_LIMIT >= 64
-          , (((F_CPU) / ISR_EXECUTION_CYCLES(6)) >> 6)
-        #endif
-        #if MULTISTEPPING_LIMIT >= 128
-          , (((F_CPU) / ISR_EXECUTION_CYCLES(7)) >> 7)
-        #endif
-      };
-
-      // Find a doable step rate using multistepping
-      uint8_t multistep = 1;
-      for (uint8_t i = 0; i < COUNT(limit) && step_rate > uint32_t(pgm_read_dword(&limit[i])); ++i) {
-        step_rate >>= 1;
-        multistep <<= 1;
-      }
-      steps_per_isr = multistep;
-
-    #endif
-
-  #elif MULTISTEPPING_LIMIT > 1
-
-    uint8_t loops = steps_per_isr;
-    if (MULTISTEPPING_LIMIT >= 16 && loops >= 16) { step_rate >>= 4; loops >>= 4; }
-    if (MULTISTEPPING_LIMIT >=  4 && loops >=  4) { step_rate >>= 2; loops >>= 2; }
-    if (MULTISTEPPING_LIMIT >=  2 && loops >=  2) { step_rate >>= 1; }
-
+    // Select the proper multistepping
+    uint8_t idx = 0;
+    while (idx < 7 && step_rate > (uint32_t)pgm_read_dword(&limit[idx])) {
+      step_rate >>= 1;
+      multistep <<= 1;
+      ++idx;
+    };
+  #else
+    NOMORE(step_rate, uint32_t(MAX_STEP_ISR_FREQUENCY_1X));
   #endif
+  loops = multistep;
 
   return calc_timer_interval(step_rate);
 }
@@ -1912,13 +1879,13 @@ uint32_t Stepper::block_phase_isr() {
         // acc_step_rate is in steps/second
 
         // step_rate to timer interval and steps per stepper isr
-        interval = calc_multistep_timer_interval(acc_step_rate << oversampling_factor);
+        interval = calc_timer_interval(acc_step_rate << oversampling_factor, steps_per_isr);
         acceleration_time += interval;
 
         #if ENABLED(LIN_ADVANCE)
-          if (la_active) {
+          if (current_block->la_advance_rate) {
             const uint32_t la_step_rate = la_advance_steps < current_block->max_adv_steps ? current_block->la_advance_rate : 0;
-            la_interval = calc_timer_interval((acc_step_rate + la_step_rate) >> current_block->la_scaling);
+            la_interval = calc_timer_interval(acc_step_rate + la_step_rate) << current_block->la_scaling;
           }
         #endif
 
@@ -1985,11 +1952,11 @@ uint32_t Stepper::block_phase_isr() {
         // step_rate is in steps/second
 
         // step_rate to timer interval and steps per stepper isr
-        interval = calc_multistep_timer_interval(step_rate << oversampling_factor);
+        interval = calc_timer_interval(step_rate << oversampling_factor, steps_per_isr);
         deceleration_time += interval;
 
         #if ENABLED(LIN_ADVANCE)
-         if (la_active) {
+         if (current_block->la_advance_rate) {
             const uint32_t la_step_rate = la_advance_steps > current_block->final_adv_steps ? current_block->la_advance_rate : 0;
             if (la_step_rate != step_rate) {
               bool reverse_e = la_step_rate > step_rate;
@@ -2019,8 +1986,6 @@ uint32_t Stepper::block_phase_isr() {
                 DIR_WAIT_AFTER();
               }
             }
-            else
-              la_interval = LA_ADV_NEVER;
           }
         #endif // LIN_ADVANCE
 
@@ -2059,12 +2024,12 @@ uint32_t Stepper::block_phase_isr() {
 
 
         // Calculate the ticks_nominal for this nominal speed, if not done yet
-        if (ticks_nominal == 0) {
-          ticks_nominal = calc_multistep_timer_interval(current_block->nominal_rate << oversampling_factor);
+        if (ticks_nominal < 0) {
+          ticks_nominal = calc_timer_interval(current_block->nominal_rate << oversampling_factor, steps_per_isr);
 
           #if ENABLED(LIN_ADVANCE)
-            if (la_active)
-            la_interval = calc_timer_interval(current_block->nominal_rate >> current_block->la_scaling);
+            if (current_block->la_advance_rate)
+              la_interval = calc_timer_interval(current_block->nominal_rate) << current_block->la_scaling;
           #endif
         }
 
@@ -2207,34 +2172,35 @@ uint32_t Stepper::block_phase_isr() {
       acceleration_time = deceleration_time = 0;
 
       #if ENABLED(ADAPTIVE_STEP_SMOOTHING)
-        oversampling_factor = 0;                            // Assume no axis smoothing (via oversampling)
+        uint8_t oversampling = 0;                           // Assume no axis smoothing (via oversampling)
         // Decide if axis smoothing is possible
         uint32_t max_rate = current_block->nominal_rate;    // Get the step event rate
-        if (TERN1(DWIN_LCD_PROUI, hmiData.adaptiveStepSmoothing)) {
-          while (max_rate < MIN_STEP_ISR_FREQUENCY) {       // As long as more ISRs are possible...
-            max_rate <<= 1;                                 // Try to double the rate
-            if (max_rate < MIN_STEP_ISR_FREQUENCY)          // Don't exceed the estimated ISR limit
-              ++oversampling_factor;                        // Increase the oversampling (used for left-shift)
-          }
+        while (max_rate < MIN_STEP_ISR_FREQUENCY) {         // As long as more ISRs are possible...
+          max_rate <<= 1;                                   // Try to double the rate
+          if (max_rate < MIN_STEP_ISR_FREQUENCY)            // Don't exceed the estimated ISR limit
+            ++oversampling;                                 // Increase the oversampling (used for left-shift)
         }
+        oversampling_factor = oversampling;                 // For all timer interval calculations
+      #else
+        constexpr uint8_t oversampling = 0;
       #endif
 
       // Based on the oversampling factor, do the calculations
-      step_event_count = current_block->step_event_count << oversampling_factor;
+      step_event_count = current_block->step_event_count << oversampling;
 
       // Initialize Bresenham delta errors to 1/2
       delta_error = TERN_(LIN_ADVANCE, la_delta_error =) -int32_t(step_event_count);
 
       // Calculate Bresenham dividends and divisors
-      advance_dividend = (current_block->steps << 1).asLong();
+      advance_dividend = current_block->steps << 1;
       advance_divisor = step_event_count << 1;
 
       // No step events completed so far
       step_events_completed = 0;
 
       // Compute the acceleration and deceleration points
-      accelerate_until = current_block->accelerate_until << oversampling_factor;
-      decelerate_after = current_block->decelerate_after << oversampling_factor;
+      accelerate_until = current_block->accelerate_until << oversampling;
+      decelerate_after = current_block->decelerate_after << oversampling;
 
       #if ENABLED(MIXING_EXTRUDER)
         MIXER_STEPPER_SETUP();
@@ -2246,15 +2212,14 @@ uint32_t Stepper::block_phase_isr() {
 
       // Initialize the trapezoid generator from the current block.
       #if ENABLED(LIN_ADVANCE)
-        la_active = (current_block->la_advance_rate != 0);
         #if DISABLED(MIXING_EXTRUDER) && E_STEPPERS > 1
           // If the now active extruder wasn't in use during the last move, its pressure is most likely gone.
           if (stepper_extruder != last_moved_extruder) la_advance_steps = 0;
         #endif
 
-        if (la_active) {
+        if (current_block->la_advance_rate) {
           // apply LA scaling and discount the effect of frequency scaling
-          la_dividend = (advance_dividend.e << current_block->la_scaling) << oversampling_factor;
+          la_dividend = (advance_dividend.e << current_block->la_scaling) << oversampling;
         }
       #endif
 
@@ -2332,13 +2297,13 @@ uint32_t Stepper::block_phase_isr() {
       #endif
 
       // Calculate the initial timer interval
-      interval = calc_multistep_timer_interval(current_block->initial_rate << oversampling_factor);
+      interval = calc_timer_interval(current_block->initial_rate << oversampling_factor, steps_per_isr);
       acceleration_time += interval;
 
       #if ENABLED(LIN_ADVANCE)
-        if (la_active) {
+        if (current_block->la_advance_rate) {
           const uint32_t la_step_rate = la_advance_steps < current_block->max_adv_steps ? current_block->la_advance_rate : 0;
-la_interval = calc_timer_interval((current_block->initial_rate + la_step_rate) >> current_block->la_scaling);
+          la_interval = calc_timer_interval(current_block->initial_rate + la_step_rate) << current_block->la_scaling;
         }
       #endif
     }
@@ -2370,8 +2335,8 @@ la_interval = calc_timer_interval((current_block->initial_rate + la_step_rate) >
     // Apply Bresenham algorithm so that linear advance can piggy back on
     // the acceleration and speed values calculated in block_phase_isr().
     // This helps keep LA in sync with, for example, S_CURVE_ACCELERATION.
-    const bool e_step_needed = la_delta_error >= 0;
-    if (e_step_needed) {
+    la_delta_error += la_dividend;
+    if (la_delta_error >= 0) {
       count_position.e += count_direction.e;
       la_advance_steps += count_direction.e;
       la_delta_error -= advance_divisor;
@@ -2387,7 +2352,8 @@ la_interval = calc_timer_interval((current_block->initial_rate + la_step_rate) >
       // Enforce a minimum duration for STEP pulse ON
       #if ISR_PULSE_CONTROL
         USING_TIMED_PULSE();
-        START_TIMED_PULSE();
+        START_HIGH_PULSE();
+
         AWAIT_HIGH_PULSE();
       #endif
 
