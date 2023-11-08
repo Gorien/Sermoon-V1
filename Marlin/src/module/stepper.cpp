@@ -1768,7 +1768,8 @@ void Stepper::pulse_phase_isr() {
 uint32_t Stepper::calc_timer_interval(uint32_t step_rate) {
   #ifdef CPU_32_BIT
     // In case of high-performance processor, it is able to calculate in real-time
-    return uint32_t(STEPPER_TIMER_RATE) / step_rate;
+    constexpr uint32_t min_step_rate = uint32_t(STEPPER_TIMER_RATE) / HAL_TIMER_TYPE_MAX;
+    return step_rate > min_step_rate ? uint32_t(STEPPER_TIMER_RATE) / step_rate : HAL_TIMER_TYPE_MAX;
   #else
     // AVR is able to keep up at 30khz Stepping ISR rate.
     constexpr uint32_t min_step_rate = (F_CPU) / 500000U;
@@ -1986,6 +1987,8 @@ uint32_t Stepper::block_phase_isr() {
                 DIR_WAIT_AFTER();
               }
             }
+            else
+              la_interval = LA_ADV_NEVER;
           }
         #endif // LIN_ADVANCE
 
