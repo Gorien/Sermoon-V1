@@ -487,7 +487,7 @@ void Stepper::set_directions() {
       MIXER_STEPPER_LOOP(j) NORM_E_DIR(j);
       count_direction.e = 1;
     }
-  #elif HAS_EXTRUDERS
+  #else //HAS_EXTRUDERS
     if (motor_direction(E_AXIS)) {
       REV_E_DIR(stepper_extruder);
       count_direction.e = -1;
